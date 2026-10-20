@@ -718,7 +718,17 @@ textarea.csv-input{min-height:110px;font-family:'JetBrains Mono',monospace;font-
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
+const SUPABASE_URL = 'https://sdvhesujdjafecrplgrx.supabase.co/rest/v1/';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_v1jn7kx4UzfhFUO3D0UW7g_8RUCS3ag';
+
+const supabaseClient = window.supabase.createClient(
+  SUPABASE_URL,
+  SUPABASE_PUBLISHABLE_KEY
+);
+let currentUserId = null;
+
 const DATA_PATH = 'data/state.json';
 const LOCAL_KEY = 'trade-desk-state-v1';
 const todayStr = () => new Date().toISOString().slice(0,10);
@@ -764,8 +774,7 @@ let currentMonth = new Date();
 currentMonth.setDate(1);
 let selectedDate = null;
 let dayFilter = null;
-let artifactApi = null;
-let usingArtifact = false;
+let usingArtifact = false; // retained for the existing save-status UI
 
 const $ = s => document.querySelector(s);
 const fmtMoney = n => {
@@ -866,37 +875,61 @@ function setSaveStatus(kind){
   else text.textContent = '—';
 }
 
-async function initCapability(){
-  try{
-    if(window.claude && typeof window.claude.use === 'function'){
-      const ns = await Promise.race([
-        window.claude.use('artifact'),
-        new Promise(res => setTimeout(()=>res(null), 11000))
-      ]);
-      if(ns){ artifactApi = ns; usingArtifact = true; }
-    }
-  }catch(e){ /* no capability available in this view */ }
-}
-
 async function loadData(){
-  const cached = readLocalCache();
-  if(cached){ state = cached; renderAll(); }
-  await initCapability();
-  try{
-    const res = await fetch(DATA_PATH, {cache:'no-store'});
-    if(res.ok){
-      const remote = await res.json();
-      state = normalizeState(remote);
-      writeLocalCache();
-      renderAll();
+  try {
+    $('#loadStatus').textContent = 'Connecting to cloud…';
+
+    // Anonymous auth avoids a visible login screen. Supabase persists this
+    // browser's session, but it does not automatically sync identity across devices.
+    let { data: sessionData, error: sessionError } =
+      await supabaseClient.auth.getSession();
+
+    if (sessionError) throw sessionError;
+
+    if (!sessionData.session) {
+      const result = await supabaseClient.auth.signInAnonymously();
+      if (result.error) throw result.error;
+      sessionData = { session: result.data.session };
     }
-  }catch(e){ /* no published data file yet — fine, start from local/empty */ }
-  if(migrateTradeRR()){ scheduleSave(); }
-  $('#loadStatus').textContent = state.trades.length
-    ? `${state.trades.length} trade${state.trades.length===1?'':'s'} logged`
-    : 'no trades yet — add one or import a CSV';
-  setSaveStatus(usingArtifact ? (state.trades.length || Object.keys(state.journal).length ? 'saved' : 'idle') : 'local');
-  renderAll();
+
+    currentUserId = sessionData.session.user.id;
+
+    const { data, error } = await supabaseClient
+      .from('trade_desk_state')
+      .select('state')
+      .eq('user_id', currentUserId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (data && data.state) {
+      state = normalizeState(data.state);
+    } else {
+      state = normalizeState({});
+    }
+
+    writeLocalCache();
+
+    if (migrateTradeRR()) {
+      await commitState();
+    }
+
+    $('#loadStatus').textContent = state.trades.length
+      ? `${state.trades.length} trade${state.trades.length === 1 ? '' : 's'} logged`
+      : 'Cloud connected — no trades yet';
+
+    setSaveStatus('saved');
+    renderAll();
+  } catch (error) {
+    console.error('Trade Desk cloud load failed:', error);
+    $('#loadStatus').textContent = 'Cloud connection failed — check setup';
+    setSaveStatus('local');
+    // Do not silently load local data over cloud data. Keep the local cache
+    // visible as a fallback if cloud connection is not configured yet.
+    const cached = readLocalCache();
+    if (cached) state = cached;
+    renderAll();
+  }
 }
 
 let saveTimer = null;
@@ -907,16 +940,29 @@ function scheduleSave(){
 }
 async function commitState(){
   writeLocalCache();
-  if(usingArtifact && artifactApi){
-    try{
-      await artifactApi.publish({ [DATA_PATH]: JSON.stringify(state) });
-      setSaveStatus('saved');
-    }catch(err){
-      if(!err || err.code !== 'conflict'){
-        setSaveStatus('local');
-      }
-    }
-  } else {
+
+  if (!currentUserId) {
+    setSaveStatus('local');
+    return;
+  }
+
+  setSaveStatus('saving');
+
+  try {
+    const { error } = await supabaseClient
+      .from('trade_desk_state')
+      .upsert({
+        user_id: currentUserId,
+        state: state,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      });
+
+    if (error) throw error;
+    setSaveStatus('saved');
+  } catch (error) {
+    console.error('Trade Desk cloud save failed:', error);
     setSaveStatus('local');
   }
 }
